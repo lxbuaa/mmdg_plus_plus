@@ -1,1 +1,1 @@
-Source code and benchmark files for "Suppress and Rebalance: Towards Generalized Multi-Modal Face Anti-Spoofing"
+Source code and benchmark files for "Reliable and Balanced Transfer Learning for Generalized Multimodal Face Anti-Spoofing"
