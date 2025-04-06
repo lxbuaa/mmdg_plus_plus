@@ -1,0 +1,692 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchsnooper
+import copy
+import math
+import clip
+
+spoof_templates_RGB = [
+    'This is an example of a spoof face in RGB modality',
+    'This is an example of an attack face in RGB modality',
+    'This is not a real face in RGB modality',
+    'This is how a spoof face looks like in RGB modality',
+    'a RGB photo of a spoof face',
+    'a photo of a spoof face in RGB modality',
+    'This is not a real face captured by RGB camera',
+    'This is an example of a spoof face captured by RGB camera',
+    'a photo of a spoof face captured by RGB camera',
+]
+
+real_templates_RGB = [
+    'This is an example of a real face in RGB modality',
+    'This is an example of a bonafide face in RGB modality',
+    'This is not a spoof face in RGB modality',
+    'This is how a real face looks like in RGB modality',
+    'a RGB photo of a real face',
+    'a photo of a real face in RGB modality',
+    'This is not a spoof face captured by RGB camera',
+    'This is an example of a real face captured by RGB camera',
+    'a photo of a real face captured by RGB camera',
+]
+
+spoof_templates_depth = [
+    'This is an example of a spoof face in depth modality',
+    'This is an example of an attack face in depth modality',
+    'This is not a real face in depth modality',
+    'This is how a spoof face looks like in depth modality',
+    'a depth photo of a spoof face',
+    'a photo of a spoof face in depth modality',
+    'This is not a real face captured by depth camera',
+    'This is an example of a spoof face captured by depth camera',
+    'a photo of a spoof face captured by depth camera',
+]
+
+real_templates_depth = [
+    'This is an example of a real face in depth modality',
+    'This is an example of a bonafide face in depth modality',
+    'This is not a spoof face in depth modality',
+    'This is how a real face looks like in depth modality',
+    'a depth photo of a real face',
+    'a photo of a real face in depth modality',
+    'This is not a spoof face captured by depth camera',
+    'This is an example of a real face captured by depth camera',
+    'a photo of a real face captured by depth camera',
+]
+
+spoof_templates_ir = [
+    'This is an example of a spoof face in infrared modality',
+    'This is an example of an attack face in infrared modality',
+    'This is not a real face in infrared modality',
+    'This is how a spoof face looks like in infrared modality',
+    'a infrared photo of a spoof face',
+    'a photo of a spoof face in infrared modality',
+    'This is not a real face captured by infrared camera',
+    'This is an example of a spoof face captured by infrared camera',
+    'a photo of a spoof face captured by infrared camera',
+]
+
+real_templates_ir = [
+    'This is an example of a real face in infrared modality',
+    'This is an example of a bonafide face in infrared modality',
+    'This is not a spoof face in infrared modality',
+    'This is how a real face looks like in infrared modality',
+    'a infrared photo of a real face',
+    'a photo of a real face in infrared modality',
+    'This is not a spoof face captured by infrared camera',
+    'This is an example of a real face captured by infrared camera',
+    'a photo of a real face captured by infrared camera',
+]
+
+def reparameterize(mu, logvar, k=1):
+    sample_z = []
+    for _ in range(k):
+        std = logvar.mul(0.5).exp_()
+        eps = std.data.new(std.size()).normal_()
+        sample_z.append(eps.mul(std).add_(mu).unsqueeze(-1))
+    sample_z = torch.cat(sample_z, dim=-1)
+    return sample_z
+
+
+class CrossAttn_Token_Selection(nn.Module):
+    def __init__(
+            self,
+            dim,
+            num_heads=8,
+            qkv_bias=False,
+            qk_norm=False,
+            attn_drop=0.,
+            proj_drop=0.,
+            norm_layer=nn.LayerNorm,
+            sample_num=50,
+            exp_rate=2.25
+    ):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.dim = dim
+        self.scale = self.head_dim ** -0.5
+
+        self.q_linear_1 = nn.Linear(dim, dim, bias=qkv_bias)
+        self.q_linear_2 = nn.Linear(dim, dim, bias=qkv_bias)
+
+        self.k_linear = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_linear = nn.Linear(dim, dim, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # 计算不确定性
+        self.mean_mlp_1 = nn.Linear(dim, dim, bias=False)
+        self.mean_mlp_2 = nn.Linear(dim, dim, bias=False)
+        self.std_mlp_1 = nn.Linear(dim, dim, bias=False)
+        self.std_mlp_2 = nn.Linear(dim, dim, bias=False)
+
+        self.sample_num = sample_num
+        self.exp_rate = exp_rate
+
+    # @torchsnooper.snoop()
+    def forward(self, x_q, x_k, x_v):
+        B, N, C = x_q.shape
+        # 模态1计算q与不确定性
+        q1 = self.q_linear_1(x_q)
+        mean1 = self.mean_mlp_1(q1)
+        std1 = self.std_mlp_1(q1)
+        prob_q1 = reparameterize(mean1, std1, self.sample_num)
+        uncertainty_1 = prob_q1.var(dim=-1).mean(dim=-1, keepdim=True).detach()
+        mean_q1 = prob_q1.mean(dim=-1)
+        certainty_1 = torch.exp(-uncertainty_1 * self.exp_rate)
+
+        # 模态2计算q与不确定性
+        q2 = self.q_linear_2(x_k)
+        mean2 = self.mean_mlp_2(q2)
+        std2 = self.std_mlp_2(q2)
+        prob_q2 = reparameterize(mean2, std2, self.sample_num)
+        uncertainty_2 = prob_q2.var(dim=-1).mean(dim=-1, keepdim=True).detach()
+        mean_q2 = prob_q2.mean(dim=-1)
+        certainty_2 = torch.exp(-uncertainty_2 * self.exp_rate)
+
+        # 根据不确定性以一定概率选择模态1或者模态2
+        total_certainty = certainty_1 + certainty_2
+        token_prob_1 = total_certainty / certainty_1
+        # 训练状态下按照概率决定用模态1还是模态2，引入多样性，测试状态下直接比uncertainty大小
+        if self.training:
+            random_vals = torch.rand_like(total_certainty)
+            decision = random_vals < token_prob_1
+        else:
+            decision = certainty_2 < certainty_1
+
+        # 根据两个模态uncertainty大小组成新的q，然后对选择的模态使用不确定性进行加权
+        q_final = torch.where(decision.expand(-1, -1, self.dim), mean_q1, mean_q2)
+        certainty_final = torch.where(decision, certainty_1, certainty_2)
+
+        # 模态2计算k和v
+        k = self.k_linear(x_k).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_linear(x_v).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        # 把q, k, v都layer norm了
+        q_final = q_final.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        q_final = self.q_norm(q_final)
+        k = self.k_norm(k)
+
+        q_final = q_final * self.scale
+        attn = q_final @ k.transpose(-2, -1)
+        uc_map = certainty_final.unsqueeze(1).expand(B, 1, attn.shape[-1], attn.shape[-1])
+        attn = attn * uc_map
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return {
+            "out": x,
+            "uc": certainty_final,
+        }
+
+
+class QuickGELU(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x * torch.sigmoid(1.702 * x)
+
+class Conv2d_cd(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
+                 padding=1, dilation=1, groups=1, bias=False, theta=0.7):
+
+        super(Conv2d_cd, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.theta = theta
+
+    def forward(self, x):
+        out_normal = self.conv(x)
+
+        if math.fabs(self.theta - 0.0) < 1e-8:
+            return out_normal
+        else:
+            # pdb.set_trace()
+            [C_out, C_in, kernel_size, kernel_size] = self.conv.weight.shape
+            kernel_diff = self.conv.weight.sum(2).sum(2)
+            kernel_diff = kernel_diff[:, :, None, None]
+            out_diff = F.conv2d(input=x, weight=kernel_diff, bias=self.conv.bias, stride=self.conv.stride, padding=0,
+                                groups=self.conv.groups)
+
+            return out_normal - self.theta * out_diff
+
+
+class Cross_Convpass_UC_missing(nn.Module):
+    def __init__(self, adapter_dim=8, theta=0.5, hidden_dim=768, num_sample=50, exp_rate=2.25):
+        super(Cross_Convpass_UC_missing, self).__init__()
+        self.adapter_conv = Conv2d_cd(in_channels=adapter_dim, out_channels=adapter_dim, kernel_size=3, stride=1,
+                                      padding=1, theta=theta)
+
+        self.cross_attention = CrossAttn_Token_Selection(dim=adapter_dim, sample_num=num_sample, exp_rate=exp_rate)
+
+        self.ln_k_v = nn.LayerNorm(adapter_dim)
+        self.ln_q = nn.LayerNorm(adapter_dim)
+
+        # 对k和v模态降维
+        self.adapter_down_k_v = nn.Linear(hidden_dim, adapter_dim)  # equivalent to 1 * 1 Conv
+        nn.init.xavier_uniform_(self.adapter_down_k_v.weight)
+        nn.init.zeros_(self.adapter_down_k_v.bias)
+
+        # 对q模态降维
+        self.adapter_down_q = nn.Linear(hidden_dim, adapter_dim)  # equivalent to 1 * 1 Conv
+        nn.init.xavier_uniform_(self.adapter_down_q.weight)
+        nn.init.zeros_(self.adapter_down_q.bias)
+
+        # cross-attention后接一个mlp
+        self.adapter_mlp = nn.Linear(adapter_dim, adapter_dim)  # equivalent to 1 * 1 Conv
+        nn.init.xavier_uniform_(self.adapter_mlp.weight)
+        nn.init.zeros_(self.adapter_mlp.bias)
+
+        # 升回原本维度
+        self.adapter_up = nn.Linear(adapter_dim, hidden_dim)  # equivalent to 1 * 1 Conv
+        nn.init.zeros_(self.adapter_up.weight)
+        nn.init.zeros_(self.adapter_up.bias)
+
+        self.act = QuickGELU()
+        self.dim = adapter_dim
+
+    # @torchsnooper.snoop()
+    def forward(self, x, x_c, missing_q=False, missing_kv=False):
+        N, B, C = x.shape
+
+        # 降维k, v模态
+        x_down_1 = self.adapter_down_k_v(x.permute(1, 0, 2))  # equivalent to 1 * 1 Conv
+        x_down_1 = self.act(x_down_1)
+        x_down_1_ln = self.ln_k_v(x_down_1)
+
+        # 降维q模态
+        x_down_2 = self.adapter_down_q(x_c.permute(1, 0, 2))  # equivalent to 1 * 1 Conv
+        x_down_2 = self.act(x_down_2)
+        x_down_2_ln = self.ln_q(x_down_2)
+        # 对两个模态进行cross-attention，仿照ViT的结构
+
+        if not missing_q:
+            # 辅助模态不缺失，则基于uncertainty进行cross-attention
+            cross_attn = self.cross_attention(x_down_2_ln, x_down_1_ln, x_down_1_ln)
+        else:
+            # 辅助模态缺失，则退化为self-attention
+            cross_attn = self.cross_attention(x_down_1_ln, x_down_1_ln, x_down_1_ln)
+
+        x_cross = cross_attn['out'] + x_down_1_ln
+        x_mlp = self.adapter_mlp(self.ln_q(x_cross))
+        x_down = x_mlp + x_cross
+
+        # 调整尺寸，进行卷积
+        x_patch = x_down[:, 1:(1 + 14 * 14)]
+        x_patch = x_patch.reshape(B, 14, 14, self.dim).permute(0, 3, 1, 2)
+        x_patch = self.adapter_conv(x_patch)
+        x_patch = x_patch.permute(0, 2, 3, 1).reshape(B, 14 * 14, self.dim)
+
+        # 处理cls token
+        x_cls = x_down[:, :1].reshape(B, 1, 1, self.dim).permute(0, 3, 1, 2)
+        x_cls = self.adapter_conv(x_cls)
+        x_cls = x_cls.permute(0, 2, 3, 1).reshape(B, 1, self.dim)
+
+        # concat之后升维
+        x_down = torch.cat([x_cls, x_patch], dim=1)
+        x_down = self.act(x_down)
+        x_up = self.adapter_up(x_down)  # equivalent to 1 * 1 Conv
+
+        if not missing_kv:
+            return {
+                "out": x_up.permute(1, 0, 2),
+                "uc": cross_attn['uc']
+            }
+        else:
+            return {
+                "out": 0.0 * x_up.permute(1, 0, 2),
+                "uc": 0.0 * cross_attn['uc']
+            }
+
+
+class MyTextEncoder(nn.Module):
+    def __init__(self, clip_model):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = torch.float32
+
+    # @torchsnooper.snoop()
+    def forward(self, prompts, tokenized_prompts):
+        x = prompts + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x).type(self.dtype)
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+
+        # ! tokenized_prompts在这里只是为了用了获得eot_token对应的embedding?
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        return x
+
+class MMDG_PP(nn.Module):
+
+    def __init__(self, num_prompt=5, adapter_pos='mlp', num_sample=50, exp_rate=2.5):
+        super(MMDG_PP, self).__init__()
+        self.model, _ = clip.load("ViT-B/16", 'cuda:0')
+        self.model.to(torch.float32)
+        self.dtype = torch.float32
+
+        # 禁用clip的梯度
+        for p in self.model.parameters(): p.requires_grad = False
+
+        # 各个模态的class token
+        self.class_token_1 = self.model.visual.class_embedding
+        self.class_token_2 = copy.deepcopy(self.class_token_1)
+        self.class_token_3 = copy.deepcopy(self.class_token_1)
+        self.class_token_1.requires_grad = True
+        self.class_token_2.requires_grad = True
+        self.class_token_3.requires_grad = True
+
+        # 各个模态的position embedding
+        self.pos_1 = copy.deepcopy(self.model.visual.positional_embedding)
+        self.pos_2 = copy.deepcopy(self.model.visual.positional_embedding)
+        self.pos_3 = copy.deepcopy(self.model.visual.positional_embedding)
+        self.pos_1.requires_grad = True
+        self.pos_2.requires_grad = True
+        self.pos_3.requires_grad = True
+
+        # 各个模态的CLIP visual_proj
+        self.visual_proj_1 = copy.deepcopy(self.model.visual.proj)
+        self.visual_proj_2 = copy.deepcopy(self.model.visual.proj)
+        self.visual_proj_3 = copy.deepcopy(self.model.visual.proj)
+        self.visual_proj_1.requires_grad = True
+        self.visual_proj_2.requires_grad = True
+        self.visual_proj_3.requires_grad = True
+
+
+        # 各个模态的adapter
+        """无丢失模态情况"""
+        # self.conv_pass_1 = nn.Sequential(*[Cross_Convpass_UC() for _ in range(self.model.visual.transformer.layers)])
+        # self.conv_pass_2 = nn.Sequential(*[Cross_Convpass_UC() for _ in range(self.model.visual.transformer.layers)])
+        # self.conv_pass_3 = nn.Sequential(*[Cross_Convpass_UC() for _ in range(self.model.visual.transformer.layers)])
+        """有丢失模态情况"""
+        self.conv_pass_1 = nn.Sequential(*[Cross_Convpass_UC_missing(num_sample=num_sample, exp_rate=exp_rate) for _ in range(self.model.visual.transformer.layers)])
+        self.conv_pass_2 = nn.Sequential(*[Cross_Convpass_UC_missing(num_sample=num_sample, exp_rate=exp_rate) for _ in range(self.model.visual.transformer.layers)])
+        self.conv_pass_3 = nn.Sequential(*[Cross_Convpass_UC_missing(num_sample=num_sample, exp_rate=exp_rate) for _ in range(self.model.visual.transformer.layers)])
+
+        dim = 512
+        self.fc_all = nn.Sequential(
+            nn.Linear(dim + dim + dim, 2),
+        )
+        self.num_prompts = num_prompt
+        self.num_domains = 5  # 4假1真
+
+        """每个模态，每个domain，都有自己的prompt"""
+        self.prompts_1 = nn.Parameter(torch.randn(self.num_domains, self.num_prompts, dim))
+        self.prompts_2 = nn.Parameter(torch.randn(self.num_domains, self.num_prompts, dim))
+        self.prompts_3 = nn.Parameter(torch.randn(self.num_domains, self.num_prompts, dim))
+
+        self.out = None
+
+        self.adapter_pos = adapter_pos
+
+    def text_encoder(self, prompts, tokenized_prompts):
+        x = prompts + self.model.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.model.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.model.ln_final(x).type(self.dtype)
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # ! tokenized_prompts在这里只是为了用了获得eot_token对应的embedding?
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.model.text_projection
+        return x
+
+    def generate_domain_texts(self, templates):
+        domain_text = ' within the deployment environment of ' + ' '.join(['X' for _ in range(self.num_prompts)])
+        return [txt + domain_text for txt in templates]
+
+    def embed_texts(self, templates, prompts, domain_idx=[0, 2, 3, 4]):
+        """
+        把文本变成embedding之后，加上learnable prompts
+        :param templates: 需要embed的文本template
+        :param prompts: learnable的prompts
+        :param domain_idx: 需要生成的domain prompt，0,2,3,4为各个domain的spoof，1为所有domain的real
+        :return: 添加prompt后的embedding
+        """
+        tokenized_texts = clip.tokenize(templates).cuda(non_blocking=True)
+        # print(tokenized_texts.shape)
+        embeddings = self.model.token_embedding(tokenized_texts)
+        domain_embed_dict = []
+        for j in domain_idx:
+            embedded_texts = []
+            for i, template in enumerate(templates):
+                x_start_pos = len(template.split()) - self.num_prompts
+                embedded_texts.append(
+                    torch.cat([
+                        embeddings[i, :x_start_pos + 1, :],
+                        prompts[j, :, :],
+                        embeddings[i, x_start_pos + 1 + self.num_prompts:, :]
+                    ], dim=0).unsqueeze(0)
+                )
+
+            embedded_texts = self.text_encoder(torch.cat(embedded_texts, dim=0), tokenized_texts)
+            embedded_texts = embedded_texts.mean(dim=0)
+            # print(embedded_texts.shape)
+            domain_embed_dict.append(embedded_texts)
+
+        return domain_embed_dict
+
+    def forward_text(self):
+        domain_spoof_templates_RGB = self.generate_domain_texts(spoof_templates_RGB)
+        domain_real_templates_RGB = self.generate_domain_texts(real_templates_RGB)
+        domain_spoof_templates_depth = self.generate_domain_texts(spoof_templates_depth)
+        domain_real_templates_depth = self.generate_domain_texts(real_templates_depth)
+        domain_spoof_templates_ir = self.generate_domain_texts(spoof_templates_ir)
+        domain_real_templates_ir = self.generate_domain_texts(real_templates_ir)
+
+        spoof_embedding_RGB = self.embed_texts(domain_spoof_templates_RGB, self.prompts_1, domain_idx=[0, 2, 3, 4])
+        real_embedding_RGB = self.embed_texts(domain_real_templates_RGB, self.prompts_1, domain_idx=[1])
+        spoof_embedding_depth = self.embed_texts(domain_spoof_templates_depth, self.prompts_2, domain_idx=[0, 2, 3, 4])
+        real_embedding_depth = self.embed_texts(domain_real_templates_depth, self.prompts_2, domain_idx=[1])
+        spoof_embedding_ir = self.embed_texts(domain_spoof_templates_ir, self.prompts_3, domain_idx=[0, 2, 3, 4])
+        real_embedding_ir = self.embed_texts(domain_real_templates_ir, self.prompts_3, domain_idx=[1])
+
+        return {
+            "spoof":{
+                "RGB": spoof_embedding_RGB,
+                "depth": spoof_embedding_depth,
+                "ir": spoof_embedding_ir
+            },
+            "real": {
+                "RGB": real_embedding_RGB,
+                "depth": real_embedding_depth,
+                "ir": real_embedding_ir
+            }
+        }
+
+    # @torchsnooper.snoop()
+    def forward_visual(self, input_1, input_2, input_3, missing=[]):
+        B, C, H, W = input_1.shape
+
+        x1 = self.model.visual.conv1(input_1.type(self.dtype))
+        x2 = self.model.visual.conv1(input_2.type(self.dtype))
+        x3 = self.model.visual.conv1(input_3.type(self.dtype))
+
+        x1 = x1.reshape(B, x1.shape[1], -1)
+        x2 = x2.reshape(B, x2.shape[1], -1)
+        x3 = x3.reshape(B, x3.shape[1], -1)
+        x1 = x1.permute(0, 2, 1)
+        x2 = x2.permute(0, 2, 1)
+        x3 = x3.permute(0, 2, 1)
+
+        xc1 = torch.cat((self.class_token_1.to(x1.dtype) + torch.zeros(B, 1, x1.shape[-1], dtype=x1.dtype, device=x1.device), x1), dim=1)
+        xc2 = torch.cat((self.class_token_2.to(x2.dtype) + torch.zeros(B, 1, x2.shape[-1], dtype=x2.dtype, device=x2.device), x2), dim=1)
+        xc3 = torch.cat((self.class_token_3.to(x3.dtype) + torch.zeros(B, 1, x3.shape[-1], dtype=x3.dtype, device=x3.device), x3), dim=1)
+
+        xc1 = xc1 + self.pos_1
+        xc2 = xc2 + self.pos_2
+        xc3 = xc3 + self.pos_3
+
+        xc1 = self.model.visual.ln_pre(xc1)
+        xc2 = self.model.visual.ln_pre(xc2)
+        xc3 = self.model.visual.ln_pre(xc3)
+
+        xc1 = xc1.permute(1, 0, 2)  # NLD -> LND
+        xc2 = xc2.permute(1, 0, 2)  # NLD -> LND
+        xc3 = xc3.permute(1, 0, 2)  # NLD -> LND
+
+        for idx in range(self.model.visual.transformer.layers):
+            # self-attention部分
+            res_block = self.model.visual.transformer.resblocks[idx]
+
+            xc1 = xc1 + res_block.attention(res_block.ln_1(xc1))
+            xc2 = xc2 + res_block.attention(res_block.ln_1(xc2))
+            xc3 = xc3 + res_block.attention(res_block.ln_1(xc3))
+
+            # adapter部分
+            """无丢失模态情况"""
+            # adapter_1_2, adapter_1_3 = self.conv_pass_1[idx](res_block.ln_2(xc1), res_block.ln_2(xc2)), self.conv_pass_1[idx](res_block.ln_2(xc1), res_block.ln_2(xc3))
+            # adapter_2_1, adapter_2_3 = self.conv_pass_2[idx](res_block.ln_2(xc2), res_block.ln_2(xc1)), self.conv_pass_2[idx](res_block.ln_2(xc2), res_block.ln_2(xc3))
+            # adapter_3_1, adapter_3_2 = self.conv_pass_3[idx](res_block.ln_2(xc3), res_block.ln_2(xc1)), self.conv_pass_3[idx](res_block.ln_2(xc3), res_block.ln_2(xc2))
+            # fuse_1 = adapter_1_2['out'] + adapter_1_3['out']
+            # fuse_2 = adapter_2_1['out'] + adapter_2_3['out']
+            # fuse_3 = adapter_3_1['out'] + adapter_3_2['out']
+
+            """有丢失模态情况"""
+            adapter_1_2_mlp, adapter_1_3_mlp = (
+                self.conv_pass_1[idx](res_block.ln_2(xc1), res_block.ln_2(xc2), missing_q=('D' in missing), missing_kv=('RGB' in missing)),
+                self.conv_pass_1[idx](res_block.ln_2(xc1), res_block.ln_2(xc3), missing_q=('IR' in missing), missing_kv=('RGB' in missing))
+            )
+
+            adapter_2_1_mlp, adapter_2_3_mlp = (
+                self.conv_pass_2[idx](res_block.ln_2(xc2), res_block.ln_2(xc1), missing_q=('RGB' in missing), missing_kv=('D' in missing)),
+                self.conv_pass_2[idx](res_block.ln_2(xc2), res_block.ln_2(xc3), missing_q=('IR' in missing), missing_kv=('D' in missing))
+            )
+
+            adapter_3_1_mlp, adapter_3_2_mlp = (
+                self.conv_pass_3[idx](res_block.ln_2(xc3), res_block.ln_2(xc1), missing_q=('RGB' in missing), missing_kv=('IR' in missing)),
+                self.conv_pass_3[idx](res_block.ln_2(xc3), res_block.ln_2(xc2), missing_q=('D' in missing), missing_kv=('IR' in missing))
+            )
+
+            # mlp部分
+            xc1 = xc1 + res_block.mlp(res_block.ln_2(xc1)) + (adapter_1_2_mlp['out'] + adapter_1_3_mlp['out'])
+            xc2 = xc2 + res_block.mlp(res_block.ln_2(xc2)) + (adapter_2_1_mlp['out'] + adapter_2_3_mlp['out'])
+            xc3 = xc3 + res_block.mlp(res_block.ln_2(xc3)) + (adapter_3_1_mlp['out'] + adapter_3_2_mlp['out'])
+
+            # 记录一下各个模态的uncertainty
+            uc_1 = (adapter_1_2_mlp['uc'] + adapter_1_3_mlp['uc']) / 2.0
+            uc_2 = (adapter_2_1_mlp['uc'] + adapter_2_3_mlp['uc']) / 2.0
+            uc_3 = (adapter_3_1_mlp['uc'] + adapter_3_2_mlp['uc']) / 2.0
+
+        xc1 = xc1.permute(1, 0, 2)  # LND -> NLD
+        xc2 = xc2.permute(1, 0, 2)  # LND -> NLD
+        xc3 = xc3.permute(1, 0, 2)  # LND -> NLD
+
+        xc1_cls = self.model.visual.ln_post(xc1[:, 0, :])
+        xc2_cls = self.model.visual.ln_post(xc2[:, 0, :])
+        xc3_cls = self.model.visual.ln_post(xc3[:, 0, :])
+
+        """用来与text prompt算相似度"""
+        if self.model.visual.proj is not None:
+            x_vis_1 = xc1_cls @ self.visual_proj_1
+            x_vis_2 = xc2_cls @ self.visual_proj_2
+            x_vis_3 = xc3_cls @ self.visual_proj_3
+
+        return {
+            "out_1": x_vis_1,
+            "out_2": x_vis_2,
+            "out_3": x_vis_3,
+            "uc_1": torch.mean(uc_1[:, 0]),
+            "uc_2": torch.mean(uc_2[:, 0]),
+            "uc_3": torch.mean(uc_3[:, 0]),
+        }
+
+    @torchsnooper.snoop()
+    def forward(self, input_1, input_2, input_3, missing=[]):
+        # Ensemble of text features
+        text_embed_dict = self.forward_text()
+
+        # embed with text encoder
+        spoof_class_embeddings_1 = text_embed_dict['spoof']['RGB']
+        real_class_embeddings_1 = text_embed_dict['real']['RGB']
+        spoof_class_embeddings_2 = text_embed_dict['spoof']['depth']
+        real_class_embeddings_2 = text_embed_dict['real']['depth']
+        spoof_class_embeddings_3 = text_embed_dict['spoof']['ir']
+        real_class_embeddings_3 = text_embed_dict['real']['ir']
+
+        # stack the embeddings for image-text similarity
+        ensemble_weights_1 = [spoof_class_embeddings_1[0], real_class_embeddings_1[-1], spoof_class_embeddings_1[1],
+                              spoof_class_embeddings_1[2], spoof_class_embeddings_1[3]]
+        ensemble_weights_2 = [spoof_class_embeddings_2[0], real_class_embeddings_2[-1], spoof_class_embeddings_2[1],
+                              spoof_class_embeddings_2[2], spoof_class_embeddings_2[3]]
+        ensemble_weights_3 = [spoof_class_embeddings_3[0], real_class_embeddings_3[-1], spoof_class_embeddings_3[1],
+                              spoof_class_embeddings_3[2], spoof_class_embeddings_3[3]]
+
+        text_features_1 = torch.stack(ensemble_weights_1, dim=0).cuda()  # [2, 512]
+        text_features_2 = torch.stack(ensemble_weights_2, dim=0).cuda()  # [2, 512]
+        text_features_3 = torch.stack(ensemble_weights_3, dim=0).cuda()  # [2, 512]
+
+        # get the image features
+        vis_res = self.forward_visual(input_1, input_2, input_3, missing)
+        v_feat_1, v_feat_2, v_feat_3 = vis_res['out_1'], vis_res['out_2'], vis_res['out_3']
+        uc_1, uc_2, uc_3 = vis_res['uc_1'], vis_res['uc_2'], vis_res['uc_3']
+
+        # normalized features
+        v_feat_1 = v_feat_1 / v_feat_1.norm(dim=-1, keepdim=True)
+        v_feat_2 = v_feat_2 / v_feat_2.norm(dim=-1, keepdim=True)
+        v_feat_3 = v_feat_3 / v_feat_3.norm(dim=-1, keepdim=True)
+
+        text_features_1 = text_features_1 / text_features_1.norm(dim=-1, keepdim=True)
+        text_features_2 = text_features_2 / text_features_2.norm(dim=-1, keepdim=True)
+        text_features_3 = text_features_3 / text_features_3.norm(dim=-1, keepdim=True)
+
+        logit_scale = self.model.logit_scale.exp()
+        logits_per_image_1 = logit_scale * v_feat_1 @ text_features_1.t()  # [B, 2]
+        logits_per_image_2 = logit_scale * v_feat_2 @ text_features_2.t()  # [B, 2]
+        logits_per_image_3 = logit_scale * v_feat_3 @ text_features_3.t()  # [B, 2]
+
+        similarity_1 = logits_per_image_1.narrow(0, 0, input_1.size(0))
+        similarity_2 = logits_per_image_2.narrow(0, 0, input_2.size(0))
+        similarity_3 = logits_per_image_3.narrow(0, 0, input_3.size(0))
+
+        """没有的模态置0"""
+        if 'RGB' in missing:
+            v_feat_1 = 0.0 * v_feat_1
+        if 'D' in missing:
+            v_feat_2 = 0.0 * v_feat_2
+        if 'IR' in missing:
+            v_feat_3 = 0.0 * v_feat_3
+
+        logits_all = torch.cat([v_feat_1, v_feat_2, v_feat_3], dim=1)
+        cls_score = self.fc_all(logits_all)
+
+        # 计算loss，各个模态的单边loss，和全部模态的CE loss
+        self.out = {
+            "out_all": cls_score,
+            "out_1": similarity_1, "out_2": similarity_2, "out_3": similarity_3,
+            "uc_1": uc_1, "uc_2": uc_2, "uc_3": uc_3,
+        }
+        return self.out
+
+    def cal_loss(self, spoof_label, domain_label, loss_func_spoof, loss_func_domain):
+        loss_global = loss_func_spoof(self.out['out_all'], spoof_label.squeeze(-1))
+
+        if self.out['out_1'].shape[0] > 1:
+            loss_m1 = loss_func_domain(self.out['out_1'], domain_label.squeeze(-1))
+            loss_m2 = loss_func_domain(self.out['out_2'], domain_label.squeeze(-1))
+            loss_m3 = loss_func_domain(self.out['out_3'], domain_label.squeeze(-1))
+        else:
+            loss_m1 = loss_func_domain(self.out['out_1'], domain_label)
+            loss_m2 = loss_func_domain(self.out['out_2'], domain_label)
+            loss_m3 = loss_func_domain(self.out['out_3'], domain_label)
+
+        return {
+            "total": loss_global,
+            "m1": loss_m1,
+            "m2": loss_m2,
+            "m3": loss_m3,
+            "uc_1": self.out['uc_1'],
+            "uc_2": self.out['uc_2'],
+            "uc_3": self.out['uc_3']
+        }
+
+    def forward_test(self, input_1, input_2, input_3, missing=[]):
+        vis_res = self.forward_visual(input_1, input_2, input_3, missing)
+        v_feat_1, v_feat_2, v_feat_3 = vis_res['out_1'], vis_res['out_2'], vis_res['out_3']
+        v_feat_1 = v_feat_1 / v_feat_1.norm(dim=-1, keepdim=True)
+        v_feat_2 = v_feat_2 / v_feat_2.norm(dim=-1, keepdim=True)
+        v_feat_3 = v_feat_3 / v_feat_3.norm(dim=-1, keepdim=True)
+
+        """没有的模态置0"""
+        if 'RGB' in missing:
+            v_feat_1 = 0.0 * v_feat_1
+        if 'D' in missing:
+            v_feat_2 = 0.0 * v_feat_2
+        if 'IR' in missing:
+            v_feat_3 = 0.0 * v_feat_3
+
+        logits_all = torch.cat([v_feat_1, v_feat_2, v_feat_3], dim=1)
+        cls_score = self.fc_all(logits_all)
+        return {
+            "out_all": cls_score
+        }
+
+
+if __name__ == '__main__':
+    from torchvision import transforms as T
+
+    spoof_texts_1 = clip.tokenize(spoof_templates_RGB).cuda(non_blocking=True)  # tokenize
+    print(spoof_texts_1.shape)
+
+    x1 = torch.randn(4, 3, 224, 224).cuda()
+    x1 = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])(x1)
+    x2 = torch.randn(4, 3, 224, 224).cuda()
+    x2 = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])(x2)
+    x3 = torch.randn(4, 3, 224, 224).cuda()
+    x3 = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])(x3)
+
+    net = MMDG_PP().cuda()
+    print(net(x1, x2, x3, missing=['D']))
