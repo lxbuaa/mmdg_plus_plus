@@ -1,9 +1,5 @@
-# Reliable and Balanced Transfer Learning for Generalized Multimodal Face Anti-Spoofing (MMDG++)
-
-This repository contains the **source code** and **benchmark files** for the paper:
-
-> **Reliable and Balanced Transfer Learning for Generalized Multimodal Face Anti-Spoofing**  
-> (Accepted to [Your Conference Name], 202X)
+> **Reliable and Balanced Transfer Learning for Generalized Multimodal Face Anti-Spoofing**  (MMDG++)
+> (Under Review)
 
 ---
 
