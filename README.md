@@ -12,7 +12,7 @@ However, these methods often struggle to generalize to unseen attacks and divers
 1. **Modality unreliability** – sensors like depth and infrared may suffer from domain shifts, hindering reliable cross-modal fusion.
 2. **Modality imbalance** – over-reliance on a dominant modality weakens robustness against certain attacks.
 
-To address these challenges, we propose **MMDG++**, a **multi**modal **d**omain-**g**eneralized FAS framework built upon the vision-language model **CLIP**.
+To address these challenges, we propose **MMDG++**, a multimodal domain-generalized FAS framework built upon the vision-language model **CLIP**.
 
 - We design the **U-Adapter++** (Uncertainty-Guided Cross-Adapter++) to filter out unreliable regions within each modality, enabling robust multimodal interactions.
 - We introduce **ReGrad** (Rebalanced Modality Gradient Modulation), which adaptively balances modality-specific gradients for stable convergence.
