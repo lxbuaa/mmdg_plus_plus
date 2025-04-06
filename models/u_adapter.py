@@ -88,9 +88,9 @@ class CDC_Adapter(nn.Module):
         return x_up
 
 
-class my_ViT_3modality_CDC_Adapter(nn.Module):
+class MMDG(nn.Module):
     def __init__(self, ):
-        super(my_ViT_3modality_CDC_Adapter, self).__init__()
+        super(MMDG, self).__init__()
         self.num_encoders = 12
         dim = 768
 
