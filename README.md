@@ -18,8 +18,7 @@ To address these challenges, we propose **MMDG++**, a multimodal domain-generali
 - We introduce **ReGrad** (Rebalanced Modality Gradient Modulation), which adaptively balances modality-specific gradients for stable convergence.
 - We further enhance generalization with **ADPs** (Asymmetric Domain Prompts), which leverage CLIP’s language priors to learn generalized decision boundaries across modalities.
 
-We also construct a new **multimodal FAS benchmark** to evaluate generalizability under varied deployment conditions.  
-Extensive experiments demonstrate that our method achieves **state-of-the-art performance** and superior generalization across multiple FAS tasks.
+We also construct a new **multimodal FAS benchmark** to evaluate generalizability under varied deployment conditions. Extensive experiments demonstrate that our method achieves **state-of-the-art performance** and superior generalization across multiple FAS tasks.
 
 ---
 
